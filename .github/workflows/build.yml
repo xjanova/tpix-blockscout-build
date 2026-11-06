@@ -1,0 +1,121 @@
+# Build Blockscout backend + frontend images from upstream release tags.
+#
+# Why this repo exists: upstream stopped publishing public images after
+# backend 9.0.2 / frontend v2.3.5 (later releases live in blockscout-private),
+# and the TPIX chain host (8GB RAM, 4 validators) cannot build them inside a
+# safe memory cap. GitHub-hosted runners (16GB) build them unmodified from the
+# upstream tags; the images are attached to a release as gzip'd `docker save`
+# tarballs plus SHA-256 sums, which the chain host downloads and `docker load`s.
+#
+# Developed by Xman Studio
+name: build-images
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - versions.env
+      - .github/workflows/build.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-images
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.v.outputs.tag }}
+      backend: ${{ steps.v.outputs.backend }}
+      frontend_tag: ${{ steps.v.outputs.frontend_tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        run: |
+          set -a; . ./versions.env; set +a
+          echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "backend=$(printf '%s\n' $BACKEND_VERSIONS | jq -R . | jq -sc .)" >> "$GITHUB_OUTPUT"
+          echo "frontend_tag=$FRONTEND_TAG" >> "$GITHUB_OUTPUT"
+      - name: Create release (once)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "${{ steps.v.outputs.tag }}" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create "${{ steps.v.outputs.tag }}" -R "$GITHUB_REPOSITORY" \
+              --title "${{ steps.v.outputs.tag }}" \
+              --notes "Unmodified upstream Blockscout builds for the TPIX explorer. Load with: gunzip -c <file>.tar.gz | docker load"
+
+  backend:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ${{ fromJSON(needs.prepare.outputs.backend) }}
+    steps:
+      - name: Free disk
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL && df -h /
+      - uses: actions/checkout@v4
+        with:
+          repository: blockscout/blockscout
+          ref: v${{ matrix.version }}
+          path: src
+      - uses: docker/setup-buildx-action@v3
+      - name: Build
+        run: |
+          docker buildx build --load --progress=plain \
+            -f src/docker/Dockerfile \
+            --build-arg RELEASE_VERSION=${{ matrix.version }} \
+            --build-arg BLOCKSCOUT_VERSION=v${{ matrix.version }} \
+            --build-arg DECODE_NOT_A_CONTRACT_CALLS=false \
+            --build-arg MIXPANEL_URL= --build-arg MIXPANEL_TOKEN= \
+            --build-arg AMPLITUDE_URL= --build-arg AMPLITUDE_API_KEY= \
+            -t tpix/blockscout:${{ matrix.version }} src
+      - name: Smoke test
+        continue-on-error: true
+        run: docker run --rm --entrypoint sh tpix/blockscout:${{ matrix.version }} -c 'ls /app/bin && /app/bin/blockscout version'
+      - name: Save + upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          f=blockscout-${{ matrix.version }}.tar.gz
+          docker save tpix/blockscout:${{ matrix.version }} | gzip -1 > "$f"
+          sha256sum "$f" > "$f.sha256"
+          ls -lh "$f"
+          gh release upload "${{ needs.prepare.outputs.tag }}" "$f" "$f.sha256" --clobber -R "$GITHUB_REPOSITORY"
+
+  frontend:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Free disk
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL && df -h /
+      - uses: actions/checkout@v4
+        with:
+          repository: blockscout/frontend
+          ref: ${{ needs.prepare.outputs.frontend_tag }}
+          path: src
+      - uses: docker/setup-buildx-action@v3
+      - name: Build
+        run: |
+          sha=$(git -C src rev-parse HEAD)
+          docker buildx build --load --progress=plain \
+            -f src/Dockerfile \
+            --build-arg GIT_COMMIT_SHA=$sha \
+            --build-arg GIT_TAG=${{ needs.prepare.outputs.frontend_tag }} \
+            -t tpix/blockscout-frontend:${{ needs.prepare.outputs.frontend_tag }} src
+      - name: Save + upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          f=blockscout-frontend-${{ needs.prepare.outputs.frontend_tag }}.tar.gz
+          docker save tpix/blockscout-frontend:${{ needs.prepare.outputs.frontend_tag }} | gzip -1 > "$f"
+          sha256sum "$f" > "$f.sha256"
+          ls -lh "$f"
+          gh release upload "${{ needs.prepare.outputs.tag }}" "$f" "$f.sha256" --clobber -R "$GITHUB_REPOSITORY"
